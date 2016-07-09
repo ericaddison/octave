@@ -1,0 +1,529 @@
+
+
+10 Aug 2015
+
+Installed octave with `sudo apt-get install octave`. Worked fine. plotting did not work. Found that I need to install both 'gnuplot' and 'gnuplot-x11' packages.
+
+Found that octave home directory is /usr/share/octave/site/m/startup
+
+Cloning into the octave Mercurial repository. Had to install mercurial, then clone with hg clone http://www.octave.org/hg/octave. Basic instructions at: 
+
+https://www.gnu.org/software/octave/doc/interpreter/Basics-of-Generating-a-Changeset.html#Basics-of-Generating-a-Changeset
+
+Possible first project, adding value readout to cursor movement in imagesc()
+
+http://wiki.octave.org/Projects#Graphics
+
+imagesc: imagesc is actually a script, located in ~/octave_dev/octave/scripts/image/imagesc.m. Calls image, which is also a script (image.m). Calls __go_image__(), look for this.
+
+Found """libinterp/corefcn/graphics.cc:DEFUN (__go_image__, args, ,""" from grep. What is this DEFUN business?
+
+From grep for "#define DEFUN", found definition in libinterp/corefcn/defun.h. DEFUN is used to define a builtin function. Macro which calls DEFUN_INTERNAL. Look for this. in defun-int.h. DEFUN_INTERNAL is a macro that calls DECLARE_FUN. look for this. hmmmmm, here is the definition of DECLARE_FUN:
+
+#define DECLARE_FUN(name, args_name, nargout_name) \
+  DECLARE_FUNX (F ## name, args_name, nargout_name)
+
+That ## thing is explained here:
+https://gcc.gnu.org/onlinedocs/cpp/Concatenation.html#Concatenation
+
+looks like it combines the tokens on either side of ## during preprocessor run, so if name=add, then the macro would expand to Fadd
+
+-------------------------------------------------------------------------------
+11 Aug 2015
+
+Found DECLARE_FUNX in same file (defun-int.h). Looks like this:
+
+#define DECLARE_FUNX(name, args_name, nargout_name) \
+  OCTAVE_EXPORT octave_value_list \
+  name (const octave_value_list& args_name, int nargout_name)
+
+So it defines a new function with name "name", has return type "octave_value_list", and takes arguments of type "octave_value_list" and int. What is this OCTAVE_EXPORT macro? Grepping for "#define OCTAVE_EXPORT" thinks it lives in the file oct-conf-post.in.h... Looks like it is only defined if _MSC_VER is defined. I think this is a microsoft thing, look for it. 
+
+/* oct-dlldefs.h */
+
+#if defined (_MSC_VER)
+#define OCTAVE_EXPORT __declspec(dllexport)
+#define OCTAVE_IMPORT __declspec(dllimport)
+#else
+/* All other compilers, at least for now. */
+#define OCTAVE_EXPORT
+#define OCTAVE_IMPORT
+#endif
+
+From microsoft.com about _MSC_VER: Evaluates to an integer literal that encodes the major, minor, and build number components of the compiler's version number. The major number is the first component of the period-delimited version number, the minor number is the second component, and the build number is the third component. For example, if the version number of the Visual C++ compiler is 15.00.20706.01, the _MSC_FULL_VER macro evaluates to 150020706. Type cl /? at the command line to view the compiler's version number.
+
+https://msdn.microsoft.com/en-us/library/b0084kay.aspx
+
+So yeah, this is only defined if using MS Visual C++ compiler, otherwise both OCTAVE_EXPORT and OCTAVE_IMPORT are blank macros.
+
+Now that we traced down all those damn macros, back to where __go_image__ was defined... libinterp/corefcn/graphics.cc
+
+DEFUN (__go_image__, args, ,
+       "-*- texinfo -*-\n\
+@deftypefn {Built-in Function} {} __go_image__ (@var{parent})\n\
+Undocumented internal function.\n\
+@end deftypefn")
+{
+  GO_BODY (image);
+}
+
+look for GO_BODY definition. In same file:
+
+#define GO_BODY(TYPE) \
+  gh_manager::auto_lock guard; \
+ \
+  octave_value retval; \
+ \
+  if (args.length () > 0) \
+    retval = make_graphics_object (#TYPE, false, args);  \
+  else \
+    print_usage (); \
+ \
+  return retval
+
+What is gh_manager::auto_lock? First look for gh_manager in graphics.in.h. Jesus, thats a 6400 line file!
+
+classes in graphics.in.h: 
+	base_scaler, lin_scaler, log_scaler, neg_log_scaler, scaler, property,
+	base_property, string_property, string_array_property, 
+	text_label_property, radio_values, radio_property, color_values,
+	color_property, double_property, double_radio_property, array_property,
+	row_vector_property, bool_property, handle_property, any_property, 
+	children_property, callback_property, property, pval_vector,
+	property_list, graphics_toolkit, graphics_object, base_graphics_toolkit,
+	gtk_manager, base_graphics_object, graphics_object, base_properties,
+	root_figure, figure, graphics_xform, axes, line, text, image (4693),
+	patch, surface, hggroup, uimenu, uicontextmenu, uicontrol, uipanel,
+	uitoolbar, uipushtool, uitoggletool, graphics_event, base_graphics_event,
+	gh_manager, gh_manager::auto_lock.
+
+-------------------------------------------------------------------------------
+12 Aug 2015
+
+What is OCTINTERP_API? In mexproto.h, related to _MSC_VER and dll stuff for Microsoft. Normally blank.
+
+gh_manager: must be gh for graphics handle. auto_lock (line 6177) is just a simple subclass of octave_autolock. 
+instance, which is all over gh_manager, is a pointer to gh_manager. This must be a singleton object. So all of the tests for !instance must just be checking in instance==0. 
+
+Whatever all of its methods do, gh_manager is what manages all the graphics stuff!
+auto_lock is in liboctave/util/oct-mutex.h. locks or unlocks an octave_mutex: ohhhh, maybe this is all thread stuff....
+Now for octave_value (maybe later)
+
+make_graphics_object, libinterp/corefcn/graphics.cc:10495
+lots of error checking, then calls gh_manager::make_graphics_handle with go_name="image". make_graphics_handle is at line 9292. Looks like meat of this is make_graphics_object_from_type(), line 1041. HAs this for image:
+  else if (type.compare ("image"))
+    go = new image (h, p);
+
+class image is back in graphics.in.h, line 4693
+
+-------------------------------------------------------------------------------
+13 Aug 2015
+
+Strange properties syntax, says to see genprops.awk script. image is a subclass of base_graphics_object. Here is the constructor:
+
+  image (const graphics_handle& mh, const graphics_handle& p)
+    : base_graphics_object (), xproperties (mh, p)
+  {
+    xproperties.initialize_data ();
+  }
+
+mh and p are two graphics handles which could be just initialized in make_graphics_object_from_type(). 
+
+xproperties is a properties object, which is an internal class, and xproperties.initialize_data () just updates the cdata... base_graphics_object on line 2700. Where is set_xdata? Is this a gnuplot thing?
+
+So where does a window actually get created??? In the graphics handles???
+
+-------------------------------------------------------------------------------
+15 Aug 2015
+
+OK, find out where a window gets created. Here is the sequnce of events as I see it so far..
+
+imagesc(data) -> image(data) -> __go_image__() -> GO_BODY(image) -> make_graphics_object(image...)
+
+Wait! looks like the actual gui object is already created before this, according to the image script. AND, all of the types of plots have the mouse coordinate readout. Check into this... look for newplot(). in scripts/plot/util/newplot.m
+calls figure() for a new figure, in figure.m. calls __go_figure__() to make a new figure. This is in graphics.cc at line 10565. Maybe calls xcreatefcn() to make window???
+
+static void
+xcreatefcn (const graphics_handle& h)
+{
+  graphics_object go = gh_manager::get_object (h);
+  go.get_properties ().execute_createfcn  ();
+}
+
+hmmm, maybe find graphics_object and look at constructor? This was in graphics.in.h t line 2973. Has a base_graphics_object that probably does the main work... at line 2700 in same file.
+
+
+OK, somehow looking at createfcn() stuff led me to (not directly) the libgui/graphics/ directory, which includes Qt stuff and Figure.h nad Figure.cc
+
+
+Looking at Qt stuff now: the ContainerBase class is created by a macro:
+DECLARE_GENERICEVENTNOTIFY_SENDER(ContainerBase, QWidget);
+
+which does this:
+
+#define DECLARE_GENERICEVENTNOTIFY_SENDER(T,B) \
+class T : public B, public GenericEventNotifySender \
+{ \
+public: \
+  T (QWidget* xparent) : B (xparent), GenericEventNotifySender () { } \
+  ~ T (void) { } \
+\
+  bool event (QEvent* evt) \
+    { \
+      bool result = true; \
+      if (! notifyReceiversBefore (this, evt)) \
+        result = B::event (evt); \
+      notifyReceiversAfter (this, evt); \
+      return result; \
+    } \
+}
+
+So ContainerBase is a QWidget and a GenericEventNotifySender... Found this because Figure.cc uses: m_container->setMouseTracking (true); This just enables mouse-move events to be sent without mouse clicks. 
+
+in Canvas.h, found:   void canvasMouseMoveEvent (QMouseEvent* event);
+check this in Canvas.cc, at line 432.
+
+**** Possible BINGO on line 502
+
+Looks like the current graphics object is grabbed from its handle and stored as obj. A Figure* is then created from it called fig, and this is used to call updateStatusBar(). Find this function if its here. It's in Figure.cc:
+
+void
+Figure::updateStatusBar (ColumnVector pt)
+{
+  if (! m_statusBar->isHidden ())
+    m_statusBar->showMessage (QString ("(%1, %2)")
+                              .arg (pt(0), 0, 'g', 5)
+                              .arg (pt(1), 0, 'g', 5));
+}
+
+
+Might need to overload this or create an alternate version to use when the go is an image. Is that stored in a graphics_object, btw?
+
+Trying to build... No luck so far. autoconf -> ./configure gave error. Found this:
+
+$ libtoolize --force
+$ aclocal
+$ autoheader
+$ automake --force-missing --add-missing
+$ autoconf
+$ ./configure
+
+got further, but now have error about freetype2. Tried installing vflib3, no help. Seems to be doing better after installing package libfreetype6-dev.
+
+Also couldn't find javac. Installing package default-jdk.
+Installing libqt4-dev.
+
+I'm going to checkout the source again. HEre is the code I put in at line 516 in Canvas.cc
+// ERIC ADDISON 15Aug15
+        if(obj.isa("image"))
+                std::cerr << "We have an image here!\n";
+// END ERIC ADDISON
+
+OH! had to run ./bootstrap first, which took care of lots of stuff!
+
+Now to get make to run had to install "gperf" and "bison" and "flex".	
+
+Starting over from clone again. Kept getting an error about oct-parse.h...
+
+./bootstrap
+./configure
+make
+
+Error. Installing librsvg2-dev package. Actually needed librsvg2-bin.
+Also icoutils.
+epstool
+pstoedit
+fig2ps
+libmgl-fltk5
+libxft-dev
+qt4-dev-tools
+
+
+Back in Ubuntu, instlaling libfltk1.1-dev and  librsvg2-bin
+.
+
+Here is what configure is looking for:
+./configure: line 72053: -I/usr/include/qt4/QtCore: No such file or directory
+./configure: line 72054: -I/usr/include/qt4/QtGui: No such file or directory
+./configure: line 72055: -I/usr/include/qt4/QtOpenGL: No such file or directory
+./configure: line 72057: -lQtOpenGL: command not found
+checking for QT... no
+
+
+That is probably because of the manual flags I put in, but that's clearly the wrong paths. find the right ones.
+
+HEre is the command that ./configure is using to check libraries:
+I see PGK_CONFIG = /usr/bin/pkg-config
+
+found that QtOpenGL was not in the same place at the others..... Installed libqt4-opengl-dev
+
+-------------------------------------------------------------------------------
+17 Aug 2015
+
+OK,we're in business! Changed the string in te updateStatusBar function and it worked in the gui! Now need to find out how to access the data from the Qt stuff...
+
+I think I should look back at graphics_object, because that is what is used in the updateStatusBar() in Canvas.h
+
+Should follow the data now, find out who knows about it (graphics handle? graphics object?)
+
+-------------------------------------------------------------------------------
+18 Aug 2015
+
+Looks like make_graphics_object() gets the data as "args". 
+
+args gets changes to xargs = args.splice
+
+looking at octave_value_list, which contains an array of octave_values called Array_value
+
+-------------------------------------------------------------------------------
+19 Aug 2015
+
+Some progress! I printed out some fields from the octave_values in xargs, which is an octave_value_list, and has been "spliced" from the input args (should go back and find out what that means). I'm printing out the results of:
+
+xargs(i).type_id()
+xargs(i).is_real_matrix()
+xargs(i).print(std::cout)
+
+The third one is the biggie. It shows me that the incoming arguments seems to be organized in name-value pairs, i.e. xargs(0) is "cdata", and xargs(1) is the 10x10 data matrix. The rest are other things like xdata, ydata, and cdatamapping. This tells me where the data is at thsi point!
+
+The first loop below my print code is looking for a parent argument. If it finds one, it saves the value and then "splices" again. I don't see parent printed out in the list, so where is it? It's ok, it doesn't actually need the parent; if it doesn't find parent it just moves on to the next loop.
+
+If a parent is not found in the arguments, then it is taken from args(0). Trying to print out what that is right now (probably the calling object or something)
+
+xargs is passed to the graphics handle h using xset, defined on line 2586 of graphics.cc. gets the graphic object for h, then do go.set(args). look for set() in graphics_object. IT's on line 2172 of the same file. Here is the meat of that function:
+
+      for (int i = 0; i < nargin; i += 2)
+        {
+          caseless_str pname = args(i).string_value ();
+
+          if (! error_state)
+            {
+              octave_value val = args(i+1);
+
+              set_value_or_default (pname, val);
+
+              if (error_state)
+                break;
+            }
+          else
+            error ("set: expecting argument %d to be a property name", i);
+        }
+
+So it gets the value of the arguement (val) and then sets the value with set_value_or_default() (line 2388). Basically this all calls rep->set(), where rep is probably the base_graphics_object. Yes, that is what rep is. So need to find set() in base_graphics_object. This is actually a virtual function, line 2994. Calls get_properties().set(pname,pval).
+
+I bet I will be able to call something like obj.get_properties().get(pname)...
+
+What is this pname? Can I get to that? I can print it out with xargs(i).string-value().
+
+Now trying to access the data from the graphics object with:
+std::cout << "Attempting to get cdata... \n";
+graphics_handle h = gh_manager::lookup(retval);
+graphics_object go = gh_manager::get_object (h);
+go.get_properties().get("cdata").print(std::cout);
+
+
+Didn't work..= . It didn't recognize "cdata"...
+
+Actually, I think this was OK, but it failed on the first object that didn't have "cdata". This worked:
+
+graphics_handle h = gh_manager::lookup(retval);
+graphics_object go = gh_manager::get_object (h);
+if(go.get_properties().has_property("cdata"))
+{
+        std::cout << "Attempting to get cdata... \n";
+        go.get("cdata").print(std::cout);
+}
+
+Put this at the bottom of make_graphics_object.
+
+This is now working in Canvas update method:
+          if(currentObj.isa("image"))
+          {
+            std::cout << "got an image here...\n";
+            if(currentObj.get_properties().has_property("cdata"))
+                currentObj.get("cdata").print(std::cout);
+          }
+
+use dim_vector to get size? ./liboctave/array/dim-vector.h
+
+GOT IT!!!!! Thanks to drin!!!!!
+
+          if(currentObj.isa("image"))
+          {
+                // get xdata and ydata
+                octave_value xdata = currentObj.get("xdata");
+                octave_value ydata = currentObj.get("ydata");
+                octave_value cdata = currentObj.get("cdata");
+                ColumnVector v = ap.pixel2coord (event->x (), event->y ());
+                int x = floor( xdata.size()(0) * v(0) / xdata.matrix_value()(xdata.size()(0)-1) -0.5);
+                int y = floor( ydata.size()(0) * v(1) / ydata.matrix_value()(ydata.size()(0)-1) -0.5);
+                double val = cdata.matrix_value()(y,x);
+                //std::cout << "coords: " << x << "," << y << " -- " << cdata.matrix_value()(x,y) << "\n";
+                fig->updateStatusBar (ap.pixel2coord (event->x (), event->y ()),val);
+          }
+          else
+                fig->updateStatusBar (ap.pixel2coord (event->x (), event->y ()));
+        }
+
+
+-------------------------------------------------------------------------------
+21 Aug 2015
+
+OK, I want to clean it up and make it look good. HEre are some things I want to do:
+
+1) use a default argument in the existing updateStatusBar function, not a separate overload.
+2) Try to use an octave type instead of a double to send to this function. Maybe octave_value::string_value() or something like that?
+3) Get rid of comments in graphics.cc
+
+Look for Matrix class. MAybe in liboctave/array/dMatrix.h (note keyword explicit basically means no copy-constructing I think).
+
+OK, I was looking to see what kind of value is returned by the () operator with a matrix. Looks like this comes down to the Array<T> class, which returns a reference to whatever the class of T is. So it depends on how the Matrix was built...
+MArray is a subclass of Array, also templated with class T
+NDArray is a subclass of MArray, not templated but explicitly uses MArray<double>
+
+Matrix is a subclass of NDArray, so EVERY Matrix in octave is a matrix of doubles...
+
+What about other types, like ComplexMatrix? (in CMatrix.h) it is a subclass of ComplexNDArray, which is a subclass of MArray<Complex>.
+
+editing Canvas.h for new function sign.
+
+OK! I'm happy with the code changes. All in all, I have edited:
+Canvas.cc - Canvas::canvasMouseEvent
+Figure.h - changed updateStatusBar() arguments
+Figure.cc - changed arguments of updateStatusBar() to include a QString, and changed call to showMessage() to display the QString.
+
+generated the changeset with what is like a normal commit:
+hg commit -m "message"
+
+Then exported the changeset to a .diff file:
+hg export -o ../cool.diff tip
+
+Removed the diff stuff related to the configure and makefile junk, then saved in:
+~/octave_dev/displayImageValues.diff
+ 
+PATCH SUBMITTED 21Aug15!
+
+-------------------------------------------------------------------------------
+24 Aug 2015
+
+Following unimplemented impixel functions
+"impixel", ...
+          "impixelinfo", "impixelinfoval", "impixelregion", ...
+          "impixelregionpanel"
+
+-------------------------------------------------------------------------------
+25 Aug 2015
+
+Put impixelinfo.oct in the src/Makefile list of Oct files. This includes it in the make. Now I can start working on the function. 
+
+Now is there an easy way to get to the Canvas of a graphics object through the handle?
+
+When you create() a canvas for a handle, it passes back a GLCanvas (which is a subclass of Canvas). but the constructor passes the handle gh back to the contructor for Canvas.
+
+Use the code from Canvas::select_object to get what I need. I just want to get the object that leads back to a fig, which is...
+
+gh_manager and graphics_object not found. Where are those included in other files?
+
+The makefile was not including the path to the <ft2build.h> library. I put this in src/Makefile.in and now it seems better, so mow I can #include<octave/graphics.h>
+
+Now, how do I get a graphics_handle from the args?
+
+-------------------------------------------------------------------------------
+26 Aug 2015
+
+Trying to get an event filter to work on the figure, which I can access.
+
+So, I think I get a Figure from a graphics object, which makes sense since it's a QObject, but Canvas is not......... So what? OK, but GLCanvas is a QGLWidget... So how can I get to this and add an event filter there?
+
+hmmmmm, maybe this Backend::toolkitObject()? Maybe... See what I can get from QObject if I can dynamic cast to that. OR see if there is a way to find what class you are in C++...
+
+-------------------------------------------------------------------------------
+3 July 2016
+
+Woah! Back after almost a year! Here is an example of how to instantiate and edit a column vector:
+
+inline ColumnVector
+xform_vector (void)
+{
+  ColumnVector v (4, 0.0);
+
+  v(3) = 1;
+
+  return v;
+}
+
+Now, I am thinking I can use this kind of info to pack the cdata value that I want to display into the same vector that relays the point from the mouseMoved function in Canvas.cc that calls updateStatusBar(), and then I don't need the overload. Then I will just have boolean flags that calls to impixelinfo() sets to start displaying info.
+
+Damn! lost some info. Well, here are changes that let me pack the cdata value into the columnvector instead of sending in a separate string:
+
+in Canvas.cc:
+
+          axes::properties& ap = Utils::properties<axes> (axesObj);
+          ColumnVector v = ap.pixel2coord (event->x (), event->y ());
+          if (currentObj.isa ("image"))
+	    {
+              octave_value xdata = currentObj.get ("xdata");
+              octave_value ydata = currentObj.get ("ydata");
+              octave_value cdata = currentObj.get ("cdata");
+              int x = floor (xdata.size ()(0) * v(0) 
+                             / xdata.matrix_value()(xdata.size ()(0)-1) - 0.5);
+              int y = floor (ydata.size ()(0) * v(1) 
+                             / ydata.matrix_value ()(ydata.size ()(0)-1) - 0.5);
+              v.resize(v.numel()+1, cdata.matrix_value()(y,x));
+            }
+          fig->updateStatusBar (v);
+        }
+    }    
+
+and in figure.cc:
+	void
+	Figure::updateStatusBar (ColumnVector pt)//, QString val)
+	{
+	  if (! m_statusBar->isHidden ())
+	  {
+	    if(pt.numel()<5)
+	      m_statusBar->showMessage (QString ("(%1, %2)")
+		                      .arg (pt(0), 0, 'g', 5)
+		                      .arg (pt(1), 0, 'g', 5));
+	    else
+	      m_statusBar->showMessage (QString ("(%1, %2) %3")
+		                      .arg (pt(0), 0, 'g', 5)
+		                      .arg (pt(1), 0, 'g', 5)
+		                      .arg (pt(4), 0, 'g', 5));
+	  }
+	}
+
+Now need to add access conrollers.
+
+
+-------------------------------------------------------------------------------
+7 July 2016
+
+OK OK OK... I need to do this. Now, I can get to graphics_objects and the Figure from the impixelinfo function. HOW CAN I PUT A MOUSE LISTENER ON SOMETHING??? Currently there is a listener on Canvas, and that stuff is called in the MouseMoveEvent() method I am so familiar with ;) How to get that done on my own? HOW TO PUT A MOUSE LISTENER ON STUFF???
+
+-------------------------------------------------------------------------------
+8 July 2016
+
+Redownloaded octave and rebuilding. Also need to reget the image package. Remember how to do that? Easy, just downloaded package from sourceforge.
+
+Look at addReceiver(GenericEventNotifyReceiver *r) in Container::Base! Maybe this is a ticket?
+
+
+building again had to install:
+icoutils
+librsvg2-bin
+
+image package:
+ran boostrap
+had to cd to src
+run ./configure
+run make
+
+
+
+
+Also should look at how Canvas (or GLCanvas) is added somewhere as an event filter, because whatever the canvas is listenening to, thats what I want to listen to, too! Check out Figure.cc
+
+From a Figure (which I can get from a regular graphicsobject figure), I can get a container with inner_container, from which I can get a canvas. But more interesting is the container I think.
+
+I think that a Container IS a ContainerBase, which is defined through the macro DECLARE_GENERICEVENTNOTIFY_SENDER(ContainerBase, QWidget);, defined in GenericEventNotify.cc
